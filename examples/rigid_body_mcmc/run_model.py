@@ -40,18 +40,23 @@ CENTERS = np.array([
 TYPES = ["cube", "octahedron", "tetrahedron"]# "icosohedron", "cylinder"]
 COLORS = mpl.color_sequences["tab10"]
 
-def excluded_volume_restraint(X1, X2, radii=0.5, kappa=4.0):
-    '''
-    This was an attempt at a crude nxn differentibale EV restraint, but didn't work.
-    '''
+def pairwise_distances(X1, X2):
     n1 = len(X1)
     n2 = len(X2)
     i1, i2 = jnp.triu_indices(n1, m=n2)
-    d = jnp.linalg.norm(X1[i1] - X2[i2], axis=-1) - 2*radii
-    u = -kappa*(d**2)
+    d = jnp.linalg.norm(X1[i1] - X2[i2], axis=-1)
 
-    return u*(1-jnp.heaviside(d, 0)) 
-    
+    return d
+
+def excluded_volume_restraint(dij, radii=0.4, kappa=4.0):
+    '''
+    This is an attempt at a crude nxn differentibale EV restraint.
+    '''
+    dij = dij - 2*radii
+    u = -kappa*(dij**2)
+
+    return u*(1-jnp.heaviside(dij, 0))
+
 def model(shapes, restraints, translate=True, rotate=True, predictive=False, excluded_volume=True):
     n = len(shapes)
     coords = []
@@ -90,8 +95,9 @@ def model(shapes, restraints, translate=True, rotate=True, predictive=False, exc
         
         if excluded_volume:
             # add excluded volume-like restraint
-            #numpyro.factor("ev_{}{}".format(si, sj), excluded_volume_restraint(coords[si], coords[sj]))
-            pass # the above didn't seem to work as intended
+            d_ov = numpyro.deterministic("d_{}{}".format(si, sj), pairwise_distances(coords[si], coords[sj]))
+            numpyro.factor("ev_{}{}".format(si, sj), excluded_volume_restraint(d_ov))
+            #pass # the above didn't seem to work as intended
 
         if predictive:
             y_ob = None
@@ -160,7 +166,7 @@ def make_polyhedron(name, center=True, side_length=1, rand_rotate=False, rand_tr
 
     if rand_rotate:
         M = sp.stats.special_ortho_group.rvs(dim=3)
-        vertices = vertices @ M.T  # rotate the tetrahedron
+        vertices = vertices @ M.T  # rotate the polyhedron
     if rand_translate:
         t = sp.stats.uniform_direction.rvs(dim=3)
         vertices += t_scale*t 
@@ -307,22 +313,24 @@ def get_predictive_errors(prediction, restraints, standardize=True, data_key="y_
     
     return metrics
 
-def plot_ppd(prediction, restraints, ax):
+def plot_ppd(prediction, restraints, axs):
     def boxplot(Y, ax, y_label, tick_labels, data=None, title=None):
         positions = np.arange(Y.shape[1])
-        vplt = ax.violinplot(Y, positions=positions)
+        #vplt = ax.violinplot(Y, positions=positions)
+        ax.boxplot(Y, positions=positions, showfliers=False)
         if isinstance(data, list):
             for d, l in data:
-                ax.scatter(positions, d, label=l, s=8)
+                ax.scatter(positions, d, label=l, s=8, color='r')
         ax.set_xticks(positions)
         ax.set_xticklabels(tick_labels, rotation=60)
         ax.set_title(title)
-        ax.legend([vplt['bodies'][0]], [y_label])
+        #ax.legend([vplt['bodies'][0]], [y_label])
     
     Y_PPD = []
     Y_FWD = []
     Y_GTR = []
     Y_OBS = []
+    Y_OV = []
     labels = []
     for name, r in restraints.items():
         y_pp = prediction[name]
@@ -338,16 +346,26 @@ def plot_ppd(prediction, restraints, ax):
             labels.append(
                 "{}.{}-{}.{}".format(r["si"], r["dij"][0][k], r["sj"], r["dij"][1][k])
             )
-    
+        
+        # distances
+        key = "d_{}{}".format(r["si"], r["sj"])
+        Y_OV.append(prediction[key])
     Y_PPD = np.concatenate(Y_PPD, axis=-1)
     Y_FWD = np.concatenate(Y_FWD, axis=-1)
     Y_OBS = np.concatenate(Y_OBS)
     Y_GTR = np.concatenate(Y_GTR)
+    Y_OV = np.concatenate(Y_OV, axis=-1)
 
-    #fig, axes = plt.subplots(3, 2, figsize=(12, 8))
+    # plot distance restraints
     data = [(Y_OBS, "OBS")]
-    boxplot(Y_PPD, ax, "PPD", labels, data=data)
+    boxplot(Y_PPD, axs[0], "PPD", labels, data=data)
+    axs[0].set_title("Sampled Distances")
     # boxplot(Y_FWD, axes[0,1], "FWD", labels, data=data)
+
+    # plot vertex overlaps
+    Y_OV = np.sum(excluded_volume_restraint(Y_OV), axis=-1)
+    axs[1].hist(Y_OV, density=True)
+    axs[1].set_title("EV scores")
 
     # metrics_ob_ppd = get_predictive_errors(prediction, restraints, standardize=True, data_key="y_ob")
     # metrics_gt_ppd = get_predictive_errors(prediction, restraints, standardize=True, data_key="y_gt")
@@ -382,8 +400,9 @@ def plot_predictive_errors(metrics, restraints, ax, title=None):
 
 def main(args):
     ### Construct a ground-truth set of polyhedron on a grid
-    N = 3
+    N = args.num_shapes
     shapes = make_shape_set(N, names=[
+        "cube", "tetrahedron", "octahedron",
         "cube", "tetrahedron", "octahedron"
     ])
     shapes[0]["fixed"] = True # freeze the first polyhedron to fix the coordinate axes
@@ -399,8 +418,8 @@ def main(args):
         restraints["y_{}{}".format(i,j)] = r
     
     ### Plot the shapes and distance data
-    fig = plt.figure(figsize=(12, 4))
-    ax0 = fig.add_subplot(121, projection='3d', proj_type='ortho')
+    fig_3d = plt.figure(figsize=(12, 4))
+    ax0 = fig_3d.add_subplot(121, projection='3d', proj_type='ortho')
 
     # plot shapes
     for i in range(N):
@@ -422,7 +441,7 @@ def main(args):
     ax0.axis("off")
     ax0.set_aspect('equal')
 
-    ### Do HMC in pyro
+    ### Do HMC in numpyro
     q_reparam = ProjectedNormalReparam()
     reparam_model = handlers.reparam(model, {"q{}".format(i):q_reparam for i in range(N)})
     
@@ -452,33 +471,35 @@ def main(args):
         thinned_size=args.thin_size,
         align=False
     )
-    ax1 = fig.add_subplot(132, projection='3d', proj_type='ortho')
+    ax1 = fig_3d.add_subplot(132, projection='3d', proj_type='ortho')
     plot_sample(verts, edges, ax1, shapes=shapes)
 
     ### Get posterior predictive distribution
     rng_key, rng_key_ = random.split(rng_key) # don't fully understand the need for this operation
     predictive = Predictive(reparam_model, samples)
     prediction = predictive(rng_key_, shapes, restraints, translate=args.translate, rotate=args.rotate, predictive=True)
-    ax3 = fig.add_subplot(133)
-    plot_ppd(prediction, restraints, ax3)
+    
+    fig, axs = plt.subplots(1, 2, figsize=(8, 4))
+    plot_ppd(prediction, restraints, axs)
     #metrics = get_predictive_errors(prediction, restraints, standardize=True)
     #plot_predictive_errors(metrics, restraints, axes_2d[2])
 
     plt.tight_layout()
     plt.show()
-    exit(0)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Test HMC with rigid body rotation and translation")
     parser.add_argument("--num_samples", nargs="?", default=1000, type=int)
-    parser.add_argument("--num_data", nargs="?", default=6, type=int)
-    parser.add_argument("--num_chains", nargs="?", default=4, type=int)
+    parser.add_argument("--num_data", nargs="?", default=5, type=int)
+    parser.add_argument("--num_chains", nargs="?", default=2, type=int)
     parser.add_argument("--num_warmup", nargs="?", default=1000, type=int)
+    parser.add_argument("--num_shapes", nargs="?", default=3, type=int)
     parser.add_argument("--rng_seed", nargs="?", default=0, type=int)
     parser.add_argument("--thin_size", nargs="?", default=100, type=int)
     parser.add_argument("--translate", action="store_true", default=False)
     parser.add_argument("--rotate", action="store_true", default=False)
+    #parser.add_argument("--no_ev", action="store_false", default=)
     args = parser.parse_args()
 
     main(args)
